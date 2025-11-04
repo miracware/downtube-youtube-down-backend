@@ -3,3 +3,5 @@ yt-dlp
 requests
 supabase
 python-dotenv
+moviepy
+imageio-ffmpeg
