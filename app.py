@@ -15,7 +15,10 @@ import imageio_ffmpeg as ffmpeg_get
 load_dotenv()
 
 # ===== Config (env) =====
-API_SECRET = os.getenv("API_SECRET", "").strip()
+# NOTE: For development fallback to 'veysel12345' so Discord bot can call immediately.
+# In production set API_SECRET in your Render environment variables!
+API_SECRET = os.getenv("API_SECRET", "veysel12345").strip()
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "").strip()
 GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
@@ -38,8 +41,8 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__, template_folder="templates")
 
 # Basic checks
-if not API_SECRET:
-    app.logger.warning("API_SECRET not set - this makes the API public. Set API_SECRET in .env")
+if not os.getenv("API_SECRET"):
+    app.logger.warning("API_SECRET not set in environment — using fallback 'veysel12345'. Set API_SECRET in .env for production!")
 
 # ===== Helpers =====
 
@@ -52,12 +55,7 @@ def gh_headers():
     }
 
 def gh_put_file(path_in_repo: str, file_bytes: bytes, commit_msg="upload"):
-    """
-    Create or update file via GitHub Contents API.
-    Returns dict {sha, raw, jsdelivr, resp}
-    """
     url = f"{GH_API_BASE}/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{path_in_repo}"
-    # check if exists
     r = requests.get(url, headers=gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=15)
     body = {
         "message": commit_msg,
@@ -104,10 +102,9 @@ def gofile_upload(filepath: str, filename: str):
     j = r.json()
     if j.get("status") != "ok":
         raise RuntimeError(f"gofile upload failed: {j}")
-    return j.get("data")  # contains directLink, downloadPage, code, adminCode etc
+    return j.get("data")
 
 def gofile_delete(content_id_or_admin):
-    # best-effort deletion (requires adminCode usually)
     try:
         r = requests.get(f"https://api.gofile.io/deleteContent?contentId={content_id_or_admin}", timeout=10)
         return r.ok
@@ -185,8 +182,6 @@ def ffmpeg_exe():
 # compress: scale down height to max 720 if original >720, keep aspect ratio
 def compress_to_target(input_path: str, output_path: str, target_height=720, video_bitrate="1M", audio_bitrate="128k"):
     ff = ffmpeg_exe()
-    # Use -vf scale=-2:720 which keeps aspect ratio; if input smaller, ffmpeg will upscale if not careful.
-    # To avoid upscaling, use expr to min(original, target)
     vf = f"scale='if(gt(ih,{target_height}),-2,iw)':'if(gt(ih,{target_height}),{target_height},ih)'"
     cmd = [ff, "-y", "-i", input_path, "-vf", vf, "-b:v", video_bitrate, "-b:a", audio_bitrate, output_path]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -206,15 +201,28 @@ def home():
 
 @app.route("/api/upload-by-url", methods=["POST"])
 def upload_by_url():
-    # auth
-    secret = request.headers.get("x-api-secret", "")
-    if not API_SECRET or secret != API_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+    # AUTH: accept Authorization: Bearer <token> OR x-api-secret: <token>
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    alt_header = request.headers.get("x-api-secret") or request.headers.get("X-API-SECRET")
+    provided = None
+    if auth_header:
+        # if "Bearer ..." extract token
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header.split(None, 1)[1].strip()
+        else:
+            provided = auth_header.strip()
+    elif alt_header:
+        provided = alt_header.strip()
+
+    if not API_SECRET or provided != API_SECRET:
+        app.logger.warning("Unauthorized request (missing or bad API secret). Provided: %s", provided)
+        return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
     body = request.get_json(silent=True) or {}
-    url = body.get("url", "").strip()
+    # accept multiple possible field names
+    url = (body.get("url") or body.get("videoUrl") or body.get("video_url") or "").strip()
     if not url:
-        return jsonify({"error": "missing url"}), 400
+        return jsonify({"status": "error", "error": "missing url"}), 400
 
     ts = int(time.time())
     tmp_name = f"video_{ts}.mp4"
@@ -227,39 +235,34 @@ def upload_by_url():
         download_with_ytdlp(url, tmp_path)
     except Exception as e:
         app.logger.error("download error: %s", e)
-        return jsonify({"error": "download_failed", "detail": str(e)}), 500
+        return jsonify({"status": "error", "error": "download_failed", "detail": str(e)}), 500
 
     # check file exists & size
     if not os.path.exists(tmp_path):
-        return jsonify({"error": "download_missing"}), 500
+        return jsonify({"status": "error", "error": "download_missing"}), 500
     size = os.path.getsize(tmp_path)
     app.logger.info("Downloaded size: %d bytes", size)
 
-    # if too big initially (> MAX_FILESIZE_BYTES) try compress, else skip
     try:
         final_path = tmp_path
         if size > MAX_FILESIZE_BYTES:
             app.logger.info("Compressing because size %d > %d", size, MAX_FILESIZE_BYTES)
             try:
                 compress_to_target(tmp_path, compressed_path, target_height=720, video_bitrate="1M", audio_bitrate="128k")
-                # replace final if success
                 if os.path.exists(compressed_path):
                     final_path = compressed_path
                     size = os.path.getsize(final_path)
                     app.logger.info("Compressed size: %d bytes", size)
             except Exception as ce:
                 app.logger.error("Compression failed: %s", ce)
-                # proceed with original (but may be too big)
-        # after possible compression, check size limit again
+
         if size > MAX_FILESIZE_BYTES:
-            # cleanup
             try: os.remove(tmp_path)
             except: pass
             try: os.remove(compressed_path)
             except: pass
-            return jsonify({"error": "file_too_large_after_compress", "size": size}), 400
+            return jsonify({"status": "error", "error": "file_too_large_after_compress", "size": size}), 400
 
-        # prepare token + expiry
         token = generate_token()
         expires_at = (datetime.utcnow() + timedelta(seconds=RETENTION_SECONDS)).isoformat() + "Z"
         filename = Path(final_path).name
@@ -273,35 +276,32 @@ def upload_by_url():
             video_url = gh["jsdelivr"]
             provider = "github"
             provider_meta = {"sha": gh.get("sha"), "raw": gh.get("raw"), "path": path_in_repo}
-            # record to supabase
             supabase_insert(token, filename, provider, provider_meta, video_url, size, expires_at)
-            # keep local until cleanup
-            return jsonify({"token": token, "watch_path": f"/watch/{token}", "video_url": video_url, "status": "success"}), 200
+            return jsonify({"status": "success", "token": token, "watch_path": f"/watch/{token}", "video_url": video_url}), 200
         except Exception as ge:
             app.logger.error("GitHub upload failed: %s", ge)
             # fallback to GoFile
             try:
                 go_data = gofile_upload(final_path, filename)
-                # get direct or downloadPage
                 video_url = go_data.get("directLink") or go_data.get("downloadPage")
                 provider = "gofile"
                 provider_meta = go_data
                 supabase_insert(token, filename, provider, provider_meta, video_url, size, expires_at)
-                return jsonify({"token": token, "watch_path": f"/watch/{token}", "video_url": video_url, "status": "success"}), 200
+                return jsonify({"status": "success", "token": token, "watch_path": f"/watch/{token}", "video_url": video_url}), 200
             except Exception as goerr:
                 app.logger.error("GoFile upload failed: %s", goerr)
-                # cleanup
                 try: os.remove(tmp_path)
                 except: pass
                 try: os.remove(compressed_path)
                 except: pass
                 return jsonify({
+                    "status": "error",
                     "error": "all_upload_failed",
                     "message": "Video yüklenirken hatalar oluştu. Hatayı bildirmek için lütfen Discord Sunucumuza gelin: https://discord.gg/sunuculinki"
                 }), 502
 
     finally:
-        # don't delete final_path here — we want retention cleanup to remove it later
+        # keep files for retention/cleanup worker; actual removal handled by cleanup_worker
         pass
 
 # watch page
@@ -326,7 +326,6 @@ def watch(token):
     size_bytes = rec.get("size_bytes") or 0
     size_mb = round(int(size_bytes) / (1024*1024), 2) if size_bytes else "?"
     expires_str = rec.get("expires_at")
-    # simple inline template to avoid extra files
     html = f"""
     <!doctype html><html><head><meta charset='utf-8'><title>Video</title></head><body>
     <h3>Video</h3>
@@ -355,7 +354,6 @@ def cleanup_worker():
                     token = rec.get("token")
                     provider = rec.get("provider")
                     provider_meta = rec.get("provider_meta") or {}
-                    # attempt provider cleanup
                     try:
                         if provider == "github":
                             path = provider_meta.get("path")
@@ -368,7 +366,6 @@ def cleanup_worker():
                                 gofile_delete(admin)
                     except Exception as e:
                         app.logger.error("provider delete failed: %s", e)
-                    # delete db record
                     supabase_delete(token)
             else:
                 app.logger.debug("cleanup query failed %s", r.status_code)
