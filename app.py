@@ -276,7 +276,7 @@ def upload_by_url():
             # record to supabase
             supabase_insert(token, filename, provider, provider_meta, video_url, size, expires_at)
             # keep local until cleanup
-            return jsonify({"token": token, "watch_path": f"/watch/{token}", "video_url": video_url}), 200
+            return jsonify({"token": token, "watch_path": f"/watch/{token}", "video_url": video_url, "status": "success"}), 200
         except Exception as ge:
             app.logger.error("GitHub upload failed: %s", ge)
             # fallback to GoFile
@@ -287,7 +287,7 @@ def upload_by_url():
                 provider = "gofile"
                 provider_meta = go_data
                 supabase_insert(token, filename, provider, provider_meta, video_url, size, expires_at)
-                return jsonify({"token": token, "watch_path": f"/watch/{token}", "video_url": video_url}), 200
+                return jsonify({"token": token, "watch_path": f"/watch/{token}", "video_url": video_url, "status": "success"}), 200
             except Exception as goerr:
                 app.logger.error("GoFile upload failed: %s", goerr)
                 # cleanup
